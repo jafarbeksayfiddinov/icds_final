@@ -222,11 +222,26 @@ class Server:
                         try:
                             the_guys = self.group.list_me(from_name)
                             if isinstance(the_guys, list) and len(the_guys) > 1:
+                                for g in the_guys:
+                                    if g != from_name:  # Don't send back to sender
+                                        to_sock = self.logged_name2sock.get(g)
+                                        if to_sock:
+                                            mysend(to_sock, json.dumps({
+                                                "action": "message",
+                                                "from": from_name,
+                                                "message": text
+                                            }))
+
+                        except:
+                            pass
+                        try:
+                            the_guys = self.group.list_me(from_name)
+                            if isinstance(the_guys, list) and len(the_guys) > 1:
                                 participants = sorted(the_guys)
                                 conv_id = "dm:" + "+".join(participants)
                             else:
                                 conv_id = f"user:{from_name}"
-                        except Exception:
+                        except:
                             conv_id = f"user:{from_name}"
                         response = self.chatbot.get_response(
                             message=text,

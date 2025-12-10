@@ -55,6 +55,29 @@ class ClientSM:
 # And, of course, if you are so bored, just go
 # This is event handling instate "S_LOGGEDIN"
 #==============================================================================
+        if my_msg.startswith("/bot "):
+            parts= my_msg[5:].split(' ',1)
+            command = parts[0] if len(parts)>0 else ""
+            args= parts[1] if len(parts)>1 else ""
+
+            mysend(self.s, json.dumps({
+                "action": "bot_command",
+                "command": command,
+                "args": args
+            }))
+            return ""
+
+        # allow talking to the bot directly even when not connected to a peer
+        if my_msg.strip().startswith("@"):
+            mysend(self.s, json.dumps({
+                "action": "message",
+                "message": my_msg
+            }))
+            # show locally
+            self.out_msg += "[" + self.me + "] " + my_msg + "\n"
+            # Do not change state; allow normal flow to continue
+            return self.out_msg
+
         if self.state == S_LOGGEDIN:
             # todo: can't deal with multiple lines yet
             if len(my_msg) > 0:
@@ -108,13 +131,25 @@ class ClientSM:
 
             if len(peer_msg) > 0:
                 peer_msg = json.loads(peer_msg)
-                if peer_msg["action"] == "connect":
-                    self.peer = peer_msg["from"]
-                    self.out_msg += 'Request from ' + self.peer + '\n'
-                    self.out_msg += 'You are connected with ' + self.peer
-                    self.out_msg += '. Chat away!\n\n'
-                    self.out_msg += '------------------------------------\n'
-                    self.state = S_CHATTING
+                if peer_msg.get("action") == "connect":
+                    status = peer_msg.get("status")
+                    if status == "request":
+                        # Incoming invitation to chat
+                        self.peer = peer_msg.get("from", "")
+                        self.out_msg += 'Request from ' + self.peer + '\n'
+                        self.out_msg += 'You are connected with ' + self.peer
+                        self.out_msg += '. Chat away!\n\n'
+                        self.out_msg += '------------------------------------\n'
+                        self.state = S_CHATTING
+                    elif status == "success":
+                        # Ignore here; the synchronous connect_to() already handled it
+                        pass
+                    else:
+                        # Unknown connect message; ignore safely
+                        pass
+                elif peer_msg.get("action") in ("message", "bot"):
+                    sender = peer_msg.get("from", "[System]")
+                    self.out_msg += sender + ": " + peer_msg.get("message", "") + "\n"
 
 #==============================================================================
 # Start chatting, 'bye' for quit
@@ -123,18 +158,28 @@ class ClientSM:
         elif self.state == S_CHATTING:
             if len(my_msg) > 0:     # my stuff going out
                 mysend(self.s, json.dumps({"action":"exchange", "from":"[" + self.me + "]", "message":my_msg}))
+                # echo my own message locally so I can see it immediately
+                self.out_msg += "[" + self.me + "]" + my_msg + "\n"
                 if my_msg == 'bye':
                     self.disconnect()
                     self.state = S_LOGGEDIN
                     self.peer = ''
             if len(peer_msg) > 0:    # peer's stuff, coming in
                 peer_msg = json.loads(peer_msg)
-                if peer_msg["action"] == "connect":
-                    self.out_msg += "(" + peer_msg["from"] + " joined)\n"
-                elif peer_msg["action"] == "disconnect":
+                action = peer_msg.get("action")
+                if action == "connect":
+                    self.out_msg += "(" + peer_msg.get("from", "?") + " joined)\n"
+                elif action == "disconnect":
                     self.state = S_LOGGEDIN
+                elif action in ("exchange",):
+                    self.out_msg += peer_msg.get("from", "") + " " + peer_msg.get("message", "") + "\n"
+                elif action in ("message", "bot"):
+                    sender = peer_msg.get("from", "[System]")
+                    self.out_msg += sender + ": " + peer_msg.get("message", "") + "\n"
                 else:
-                    self.out_msg += peer_msg["from"] + peer_msg["message"]
+                    # Fallback: show raw content if structured fields are missing
+                    text = peer_msg.get("message") or str(peer_msg)
+                    self.out_msg += "[System]: " + text + "\n"
 
 
             # Display the menu again

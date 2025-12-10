@@ -14,6 +14,7 @@ import json
 import pickle as pkl
 from chat_utils import *
 import chat_group as grp
+from chatbot_manager import ChatBotManager
 
 class Server:
     def __init__(self):
@@ -34,6 +35,7 @@ class Server:
         # self.sonnet = pkl.load(self.sonnet_f)
         # self.sonnet_f.close()
         self.sonnet = indexer.PIndex("AllSonnets.txt")
+        self.chatbot=ChatBotManager(bot_name="AI Assistant",model="phi3:mini")
     def new_client(self, sock):
         #add to all sockets and to new clients
         print('new client...')
@@ -98,6 +100,8 @@ class Server:
 # handle connect request
 #==============================================================================
             msg = json.loads(msg)
+            # define from_name early for later use
+            from_name = self.logged_sock2name.get(from_sock, "")
             if msg["action"] == "connect":
                 to_name = msg["target"]
                 from_name = self.logged_sock2name[from_sock]
@@ -108,10 +112,17 @@ class Server:
                     to_sock = self.logged_name2sock[to_name]
                     self.group.connect(from_name, to_name)
                     the_guys = self.group.list_me(from_name)
+                    # send success response to initiator FIRST (this is what client waits for)
                     msg = json.dumps({"action":"connect", "status":"success"})
+                    mysend(from_sock, msg)
+                    # then notify peers asynchronously
                     for g in the_guys[1:]:
                         to_sock = self.logged_name2sock[g]
-                        mysend(to_sock, json.dumps({"action":"connect", "status":"request", "from":from_name}))
+                        mysend(to_sock, json.dumps({
+                            "action":"connect", "status":"request", "from":from_name
+                        }))
+                    # skip sending a request back to initiator to avoid confusing the blocking response read
+                    return
                 else:
                     msg = json.dumps({"action":"connect", "status":"no-user"})
                 mysend(from_sock, msg)
@@ -128,6 +139,20 @@ class Server:
                     to_sock = self.logged_name2sock[g]
                     self.indices[g].add_msg_and_index(said2)
                     mysend(to_sock, json.dumps({"action":"exchange", "from":msg["from"], "message":msg["message"]}))
+                # Record human-to-human chat into bot context for this conversation
+                try:
+                    if isinstance(the_guys, list) and len(the_guys) > 1:
+                        participants = sorted(the_guys)  # includes from_name and peers
+                        conv_id = "dm:" + "+".join(participants)
+                    else:
+                        conv_id = f"user:{from_name}"
+                    bot = self.chatbot.get_bot_for_conversation(conv_id)
+                    bot.messages.append({
+                        "role": "user",
+                        "content": f"{from_name}: {msg['message']}"
+                    })
+                except Exception as e:
+                    print(f"Bot context append error: {e}")
 #==============================================================================
 #                 listing available peers
 #==============================================================================
@@ -178,11 +203,63 @@ class Server:
 #==============================================================================
 #                 the "from" guy really, really has had enough
 #==============================================================================
-
+            elif msg["action"]=="bot_command":
+                return self.handle_bot_command(from_sock, msg)
         else:
             #client died unexpectedly
             self.logout(from_sock)
-
+        # Chatbot mention handling (kept safe and within parsed msg scope)
+        if isinstance(msg, dict):
+            try:
+                text = msg.get("message", "")
+                if text:
+                    tl = text.lower()
+                    bot_lower = self.chatbot.bot_name.lower()
+                    mention_tags = {f"@{bot_lower}", "@ai", "@aiassistant", "@ai-assistant","@bot"}
+                    mentioned = any(tag in tl for tag in mention_tags)
+                    if mentioned:
+                        # Build a shared conversation id based on current chat participants
+                        try:
+                            the_guys = self.group.list_me(from_name)
+                            if isinstance(the_guys, list) and len(the_guys) > 1:
+                                participants = sorted(the_guys)
+                                conv_id = "dm:" + "+".join(participants)
+                            else:
+                                conv_id = f"user:{from_name}"
+                        except Exception:
+                            conv_id = f"user:{from_name}"
+                        response = self.chatbot.get_response(
+                            message=text,
+                            conversation_id=conv_id,
+                            username=from_name,
+                            is_group=False,
+                            mentioned=True
+                        )
+                        if response:
+                            payload = json.dumps({
+                                "action": "message",
+                                "from": self.chatbot.bot_name,
+                                "message": response
+                            })
+                            # If user is in a chat, broadcast bot reply to peers too
+                            try:
+                                the_guys = self.group.list_me(from_name)
+                            except Exception:
+                                the_guys = [from_name]
+                            sent_to_any = False
+                            if isinstance(the_guys, list) and len(the_guys) > 1:
+                                # send to self and peers
+                                mysend(from_sock, payload)
+                                sent_to_any = True
+                                for g in the_guys[1:]:
+                                    to_sock = self.logged_name2sock.get(g)
+                                    if to_sock:
+                                        mysend(to_sock, payload)
+                            if not sent_to_any:
+                                # fallback to self only
+                                mysend(from_sock, payload)
+            except Exception as e:
+                print(f"Bot handling error: {e}")
 #==============================================================================
 # main loop, loops *forever*
 #==============================================================================
@@ -203,6 +280,75 @@ class Server:
                #new client request
                sock, address=self.server.accept()
                self.new_client(sock)
+
+    def send_to_group(self, group_id:str, message:dict)->None:
+        if not hasattr(self, "group"):
+            print("Error: Group chat not initialized")
+            return
+        try:
+            group_id=int(group_id) if isinstance(group_id, str) and group_id.isdigit() else group_id
+            members=self.group.chat_grps.get(group_id, [])
+
+            if not members:
+                print(f"Error: Group {group_id} not found or empty")
+                return
+            message_json=json.dumps(message)
+            for member in members:
+                if member in self.logged_name2sock:
+                    try:
+                        mysend(self.logged_name2sock[member], message_json)
+                    except Exception as e:
+                        print(f"Error sending to {member}: {str(e)}")
+                        self.logout(self.logged_name2sock[member])
+        except (ValueError, AttributeError) as e:
+            print(f"Error processing group message: {str(e)}")
+
+    def handle_bot_command(self, from_sock, msg):
+        command=msg.get("command","").lower()
+        from_name=self.logged_sock2name[from_sock]
+        if command=="reset":
+            solo_conv = f"user:{from_name}"
+            try:
+                the_guys = self.group.list_me(from_name)
+                if isinstance(the_guys, list) and len(the_guys) > 1:
+                    participants = sorted(the_guys)  # e.g., ['A','B']
+                    dm_conv = "dm:" + "+".join(participants)  # e.g., dm:A+B
+                else:
+                    dm_conv = None
+            except Exception:
+                dm_conv = None
+
+            self.chatbot.reset_conversation(solo_conv)
+            if dm_conv:
+                self.chatbot.reset_conversation(dm_conv)
+
+            response = "Bot conversation memory has been reset."
+        elif command in ("persona", "personality"):
+            conv_id = f"user:{from_name}"
+            persona_text = msg.get("args", "").strip()
+            if not persona_text:
+                response = (
+                    "Usage: /bot persona <style/role>. e.g.\n"
+                    " /bot persona You are a friendly Chinese tutor. Use HSK1 words and pinyin."
+                )
+            else:
+                # Ensure a bot exists, then append a system message without resetting context
+                bot = self.chatbot.get_bot_for_conversation(conv_id)
+                bot.messages.append({
+                    "role": "system",
+                    "content": persona_text
+                })
+                response = "Personality updated for this conversation."
+        else:
+            response= (
+                "Available commands:\n"
+                "/bot persona <text> - Set my personality without resetting context\n"
+                "/bot reset - Reset our conversation\n"
+                "In chats, mention me with @AI to talk!"
+            )
+        mysend(from_sock, json.dumps({
+            "action":"bot", "message":response
+        }))
 
 def main():
     server=Server()

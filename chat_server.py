@@ -36,7 +36,6 @@ class Server:
         # self.sonnet_f.close()
         self.sonnet = indexer.PIndex("AllSonnets.txt")
         self.chatbot=ChatBotManager(bot_name="AI Assistant",model="phi3:mini")
-        self.user_passwords={}
     def new_client(self, sock):
         #add to all sockets and to new clients
         print('new client...')
@@ -53,20 +52,6 @@ class Server:
 
                 if msg["action"] == "login":
                     name = msg["name"]
-                    pwd=msg["password"]
-                    if name not in self.user_passwords:
-                        self.user_passwords[name]=pwd
-                        account_status="registered"
-                    else:
-                        if self.user_passwords[name]!=pwd:
-                            mysend(sock,json.dumps({
-                                "action":"login",
-                                "status":"wrong password"
-                            }))
-                            print("Password incorrect for",name)
-                            return
-                       account_status="ok"
-                    
                     if self.group.is_member(name) != True:
                         #move socket from new clients list to logged clients
                         self.new_clients.remove(sock)
